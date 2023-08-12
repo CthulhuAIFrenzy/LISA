@@ -12,52 +12,29 @@ import tqdm
 import transformers
 from torch.utils.tensorboard import SummaryWriter
 
-from model.LISA import LISA
-from utils.dataset import HybridDataset, ValDataset, collate_fn
-from utils.utils import (
-    AverageMeter,
-    ProgressMeter,
-    Summary,
-    dict_to_cuda,
-    intersectionAndUnionGPU,
+from lisaseg.model.lisa import LISA
+from lisaseg.utils.dataset import HybridDataset, ValDataset, collate_fn
+from lisaseg.utils.utils import (
+    AverageMeter, ProgressMeter, Summary, dict_to_cuda, intersectionAndUnionGPU,
 )
 
 
 def parse_args(args):
     parser = argparse.ArgumentParser(description="LISA Model Training")
     parser.add_argument("--local_rank", default=0, type=int, help="node rank")
-    parser.add_argument(
-        "--version", default="liuhaotian/llava-llama-2-13b-chat-lightning-preview"
-    )
+    parser.add_argument("--version", default="liuhaotian/llava-llama-2-13b-chat-lightning-preview")
     parser.add_argument("--vis_save_path", default="./vis_output", type=str)
-    parser.add_argument(
-        "--precision",
-        default="bf16",
-        type=str,
-        choices=["fp32", "bf16", "fp16"],
-        help="precision for inference",
-    )
+    parser.add_argument("--precision", default="bf16", type=str, choices=["fp32", "bf16", "fp16"], help="precision for inference")
     parser.add_argument("--image_size", default=1024, type=int, help="image size")
     parser.add_argument("--model_max_length", default=512, type=int)
     parser.add_argument("--lora_r", default=8, type=int)
-    parser.add_argument(
-        "--vision-tower", default="openai/clip-vit-large-patch14", type=str
-    )
+    parser.add_argument("--vision-tower", default="openai/clip-vit-large-patch14", type=str)
     parser.add_argument("--load_in_8bit", action="store_true", default=False)
     parser.add_argument("--load_in_4bit", action="store_true", default=False)
-
-    parser.add_argument(
-        "--dataset", default="sem_seg||refer_seg||vqa||reason_seg", type=str
-    )
+    parser.add_argument("--dataset", default="sem_seg||refer_seg||vqa||reason_seg", type=str)
     parser.add_argument("--sample_rates", default="9,3,3,1", type=str)
-    parser.add_argument(
-        "--sem_seg_data",
-        default="ade20k||cocostuff||pascal_part||paco_lvis||mapillary",
-        type=str,
-    )
-    parser.add_argument(
-        "--refer_seg_data", default="refclef||refcoco||refcoco+||refcocog", type=str
-    )
+    parser.add_argument("--sem_seg_data", default="ade20k||cocostuff||pascal_part||paco_lvis||mapillary", type=str)
+    parser.add_argument("--refer_seg_data", default="refclef||refcoco||refcoco+||refcocog", type=str)
     parser.add_argument("--vqa_data", default="llava_instruct_150k", type=str)
     parser.add_argument("--reason_seg_data", default="ReasonSeg|train", type=str)
     parser.add_argument("--val_dataset", default="ReasonSeg|val", type=str)
@@ -66,14 +43,8 @@ def parse_args(args):
     parser.add_argument("--exp_name", default="lisa", type=str)
     parser.add_argument("--epochs", default=10, type=int)
     parser.add_argument("--steps_per_epoch", default=500, type=int)
-    parser.add_argument(
-        "--batch_size", default=2, type=int, help="batch size per device per step"
-    )
-    parser.add_argument(
-        "--grad_accumulation_steps",
-        default=10,
-        type=int,
-    )
+    parser.add_argument("--batch_size", default=2, type=int, help="batch size per device per step")
+    parser.add_argument("--grad_accumulation_steps", default=10, type=int)
     parser.add_argument("--val_batch_size", default=1, type=int)
     parser.add_argument("--workers", default=4, type=int)
     parser.add_argument("--lr", default=0.0003, type=float)
