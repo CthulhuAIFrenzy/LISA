@@ -185,7 +185,7 @@ def train_epoch(train_iter, epoch, model_engine, scheduler, writer, args):
                 input_dict["images"] = input_dict["images"].float()
                 input_dict["images_clip"] = input_dict["images_clip"].float()
 
-            output_dict = model(**input_dict)
+            output_dict = model_engine(**input_dict)
 
             loss = output_dict["loss"]
             ce_loss = output_dict["ce_loss"]
