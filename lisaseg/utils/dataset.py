@@ -11,19 +11,19 @@ from transformers import CLIPImageProcessor
 
 from lisaseg.model.segment_anything.utils.transforms import ResizeLongestSide
 
-from .conversation import get_default_conv_template
-from .data_processing import get_mask_from_json
-from .reason_seg_dataset import ReasonSegDataset
-from .refer import REFER
-from .refer_seg_dataset import ReferSegDataset
-from .sem_seg_dataset import SemSegDataset
-from .utils import (
+from lisaseg.utils.conversation import get_default_conv_template
+from lisaseg.utils.data_processing import get_mask_from_json
+from lisaseg.utils.reason_seg_dataset import ReasonSegDataset
+from lisaseg.utils.refer import REFER
+from lisaseg.utils.refer_seg_dataset import ReferSegDataset
+from lisaseg.utils.sem_seg_dataset import SemSegDataset
+from lisaseg.utils.utils import (
     DEFAULT_IM_END_TOKEN,
     DEFAULT_IM_START_TOKEN,
     DEFAULT_IMAGE_PATCH_TOKEN,
     DEFAULT_IMAGE_TOKEN,
 )
-from .vqa_dataset import VQADataset
+from lisaseg.utils.vqa_dataset import VQADataset
 
 
 def collate_fn(batch, tokenizer=None):

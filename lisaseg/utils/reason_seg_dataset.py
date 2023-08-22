@@ -9,11 +9,11 @@ import torch
 import torch.nn.functional as F
 from transformers import CLIPImageProcessor
 
-from model.segment_anything.utils.transforms import ResizeLongestSide
+from lisaseg.model.segment_anything.utils.transforms import ResizeLongestSide
 
-from .conversation import get_default_conv_template
-from .data_processing import get_mask_from_json
-from .utils import (
+from lisaseg.utils.conversation import get_default_conv_template
+from lisaseg.utils.data_processing import get_mask_from_json
+from lisaseg.utils.utils import (
     ANSWER_LIST,
     DEFAULT_IM_END_TOKEN,
     DEFAULT_IM_START_TOKEN,

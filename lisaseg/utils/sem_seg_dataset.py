@@ -11,10 +11,10 @@ from PIL import Image
 from pycocotools.coco import COCO
 from transformers import CLIPImageProcessor
 
-from model.segment_anything.utils.transforms import ResizeLongestSide
+from lisaseg.model.segment_anything.utils.transforms import ResizeLongestSide
 
-from .conversation import get_default_conv_template
-from .utils import (
+from lisaseg.utils.conversation import get_default_conv_template
+from lisaseg.utils.utils import (
     ANSWER_LIST,
     DEFAULT_IM_END_TOKEN,
     DEFAULT_IM_START_TOKEN,
@@ -22,7 +22,7 @@ from .utils import (
     DEFAULT_IMAGE_TOKEN,
     SHORT_QUESTION_LIST,
 )
-
+from lisaseg.configs.classes import ADE20K_CLASSES, COCOSTUFF_CLASSES
 
 def init_mapillary(base_image_dir):
     mapillary_data_root = os.path.join(base_image_dir, "mapillary")
@@ -44,8 +44,7 @@ def init_mapillary(base_image_dir):
 
 
 def init_ade20k(base_image_dir):
-    with open("utils/ade20k_classes.json", "r") as f:
-        ade20k_classes = json.load(f)
+    ade20k_classes = ADE20K_CLASSES
     ade20k_classes = np.array(ade20k_classes)
     image_ids = sorted(
         os.listdir(os.path.join(base_image_dir, "ade20k/images", "training"))
@@ -74,11 +73,7 @@ def init_ade20k(base_image_dir):
 
 
 def init_cocostuff(base_image_dir):
-    cocostuff_classes = []
-    with open("utils/cocostuff_classes.txt") as f:
-        for line in f.readlines()[1:]:
-            cocostuff_classes.append(line.strip().split(": ")[-1])
-    cocostuff_classes = np.array(cocostuff_classes)
+    cocostuff_classes = np.array(COCOSTUFF_CLASSES)
     cocostuff_images = []
 
     cocostuff_labels = glob.glob(

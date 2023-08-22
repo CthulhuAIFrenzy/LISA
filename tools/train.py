@@ -4,6 +4,7 @@ import shutil
 import sys
 import time
 from functools import partial
+import itertools
 
 import deepspeed
 import numpy as np
@@ -17,7 +18,6 @@ from lisaseg.utils.dataset import HybridDataset, ValDataset, collate_fn
 from lisaseg.utils.utils import (
     AverageMeter, ProgressMeter, Summary, dict_to_cuda, intersectionAndUnionGPU,
 )
-
 
 def parse_args(args):
     parser = argparse.ArgumentParser(description="LISA Model Training")
@@ -43,8 +43,8 @@ def parse_args(args):
     parser.add_argument("--exp_name", default="lisa", type=str)
     parser.add_argument("--epochs", default=10, type=int)
     parser.add_argument("--steps_per_epoch", default=500, type=int)
-    parser.add_argument("--batch_size", default=2, type=int, help="batch size per device per step")
-    parser.add_argument("--grad_accumulation_steps", default=10, type=int)
+    parser.add_argument("--batch_size", default=1, type=int, help="batch size per device per step")
+    parser.add_argument("--grad_accumulation_steps", default=1, type=int)
     parser.add_argument("--val_batch_size", default=1, type=int)
     parser.add_argument("--workers", default=4, type=int)
     parser.add_argument("--lr", default=0.0003, type=float)
@@ -67,17 +67,7 @@ def parse_args(args):
     parser.add_argument("--start_epoch", default=0, type=int)
     return parser.parse_args(args)
 
-
-def main(args):
-    args = parse_args(args)
-    args.log_dir = os.path.join(args.log_base_dir, args.exp_name)
-    if args.local_rank == 0:
-        os.makedirs(args.log_dir, exist_ok=True)
-        writer = SummaryWriter(args.log_dir)
-    else:
-        writer = None
-
-    # Create model
+def create_model(args):
     tokenizer = transformers.AutoTokenizer.from_pretrained(
         args.version,
         cache_dir=None,
@@ -106,12 +96,15 @@ def main(args):
         vision_pretrained=args.vision_pretrained,
     )
 
+    return model, tokenizer
+
+def load_weight(model, args):
     if args.weight:
         state_dict = torch.load(args.weight, map_location="cpu")
         model.load_state_dict(state_dict, strict=True)
 
-    world_size = torch.cuda.device_count()
-    args.distributed = world_size > 1
+def create_datasets(args, tokenizer, world_size):
+    # 创建 train_dataset 和 val_dataset
     train_dataset = HybridDataset(
         args.dataset_dir,
         tokenizer,
@@ -148,119 +141,10 @@ def main(args):
         val_dataset = None
         print(f"Training with {len(train_dataset)} examples.")
 
-    ds_config = {
-        "train_micro_batch_size_per_gpu": args.batch_size,
-        "gradient_accumulation_steps": args.grad_accumulation_steps,
-        "optimizer": {
-            "type": "AdamW",
-            "params": {
-                "lr": args.lr,
-                "weight_decay": 0.0,
-                "betas": (args.beta1, args.beta2),
-            },
-        },
-        "scheduler": {
-            "type": "WarmupDecayLR",
-            "params": {
-                "total_num_steps": args.epochs * args.steps_per_epoch,
-                "warmup_min_lr": 0,
-                "warmup_max_lr": args.lr,
-                "warmup_num_steps": 100,
-                "warmup_type": "linear",
-            },
-        },
-        "fp16": {
-            "enabled": args.precision == "fp16",
-        },
-        "bf16": {
-            "enabled": args.precision == "bf16",
-        },
-        "gradient_clipping": 1.0,
-        "zero_optimization": {
-            "stage": 2,
-            "contiguous_gradients": True,
-            "overlap_comm": True,
-            "reduce_scatter": True,
-            "reduce_bucket_size": 5e8,
-            "allgather_bucket_size": 5e8,
-        },
-    }
-    model_engine, optimizer, train_loader, scheduler = deepspeed.initialize(
-        model=model,
-        model_parameters=model.parameters(),
-        training_data=train_dataset,
-        collate_fn=partial(collate_fn, tokenizer=tokenizer),
-        config=ds_config,
-    )
+    return train_dataset, val_dataset
 
-    if val_dataset is not None:
-        assert args.val_batch_size == 1
-        val_sampler = torch.utils.data.distributed.DistributedSampler(
-            val_dataset, shuffle=False, drop_last=False
-        )
-        val_loader = torch.utils.data.DataLoader(
-            val_dataset,
-            batch_size=args.val_batch_size,
-            shuffle=False,
-            num_workers=args.workers,
-            pin_memory=False,
-            sampler=val_sampler,
-            collate_fn=partial(collate_fn, tokenizer=tokenizer),
-        )
-
-    train_iter = iter(train_loader)
-    best_score, cur_ciou = 0.0, 0.0
-
-    if args.eval_only:
-        giou, ciou = validate(val_loader, model_engine, 0, writer, args)
-        exit()
-
-    for epoch in range(args.start_epoch, args.epochs):
-        # train for one epoch
-        train_iter = train(
-            train_loader,
-            model_engine,
-            epoch,
-            scheduler,
-            writer,
-            train_iter,
-            args,
-        )
-
-        if args.no_eval == False:
-            giou, ciou = validate(val_loader, model_engine, epoch, writer, args)
-            is_best = giou > best_score
-            best_score = max(giou, best_score)
-            cur_ciou = ciou if is_best else cur_ciou
-
-        if args.no_eval or is_best:
-            save_dir = os.path.join(args.log_dir, "ckpt_model")
-            if args.local_rank == 0:
-                torch.save(
-                    {"epoch": epoch},
-                    os.path.join(
-                        args.log_dir,
-                        "meta_log_giou{:.3f}_ciou{:.3f}.pth".format(
-                            best_score, cur_ciou
-                        ),
-                    ),
-                )
-                if os.path.exists(save_dir):
-                    shutil.rmtree(save_dir)
-            torch.distributed.barrier()
-            model_engine.save_checkpoint(save_dir)
-
-
-def train(
-    train_loader,
-    model,
-    epoch,
-    scheduler,
-    writer,
-    train_iter,
-    args,
-):
-    """Main training loop."""
+def train_epoch(train_iter, epoch, model_engine, scheduler, writer, args):
+    # 训练一个 epoch
     batch_time = AverageMeter("Time", ":6.3f")
     data_time = AverageMeter("Data", ":6.3f")
     losses = AverageMeter("Loss", ":.4f")
@@ -282,20 +166,15 @@ def train(
         prefix="Epoch: [{}]".format(epoch),
     )
 
-    # switch to train mode
-    model.train()
+    model_engine.train()
     end = time.time()
     for global_step in range(args.steps_per_epoch):
         for i in range(args.grad_accumulation_steps):
-            try:
-                input_dict = next(train_iter)
-            except:
-                train_iter = iter(train_loader)
-                input_dict = next(train_iter)
-
+            input_dict = next(train_iter)
             data_time.update(time.time() - end)
             input_dict = dict_to_cuda(input_dict)
 
+            # 调整精度
             if args.precision == "fp16":
                 input_dict["images"] = input_dict["images"].half()
                 input_dict["images_clip"] = input_dict["images_clip"].half()
@@ -314,15 +193,16 @@ def train(
             mask_dice_loss = output_dict["mask_dice_loss"]
             mask_loss = output_dict["mask_loss"]
 
+            # 更新统计指标
             losses.update(loss.item(), input_dict["images"].size(0))
             ce_losses.update(ce_loss.item(), input_dict["images"].size(0))
             mask_bce_losses.update(mask_bce_loss.item(), input_dict["images"].size(0))
             mask_dice_losses.update(mask_dice_loss.item(), input_dict["images"].size(0))
             mask_losses.update(mask_loss.item(), input_dict["images"].size(0))
-            model.backward(loss)
-            model.step()
+            model_engine.backward(loss)
+            model_engine.step()
 
-        # measure elapsed time
+        # 更新训练进度显示
         batch_time.update(time.time() - end)
         end = time.time()
 
@@ -368,65 +248,174 @@ def train(
             if args.local_rank == 0:
                 writer.add_scalar("train/lr", curr_lr[0], global_step)
 
-    return train_iter
-
-
-def validate(val_loader, model_engine, epoch, writer, args):
+def validate_epoch(val_loader, epoch, model_engine, writer, args):
+    # 在验证集上评估
     intersection_meter = AverageMeter("Intersec", ":6.3f", Summary.SUM)
     union_meter = AverageMeter("Union", ":6.3f", Summary.SUM)
     acc_iou_meter = AverageMeter("gIoU", ":6.3f", Summary.SUM)
+    with torch.no_grad():
+        model_engine.eval()
+        for input_dict in tqdm.tqdm(val_loader):
+            input_dict = dict_to_cuda(input_dict)
+            # 定义精度类型到数据类型的映射
+            precision_to_dtype = {
+                "fp16": torch.float16,
+                "bf16": torch.bfloat16,
+                "fp32": torch.float32,
+            }
 
-    model_engine.eval()
+            # 调整精度
+            precision = args.precision
+            for key in ["images", "images_clip"]:
+                input_dict[key] = input_dict[key].to(dtype=precision_to_dtype[precision])
 
-    for input_dict in tqdm.tqdm(val_loader):
-        input_dict = dict_to_cuda(input_dict)
-        if args.precision == "fp16":
-            input_dict["images"] = input_dict["images"].half()
-            input_dict["images_clip"] = input_dict["images_clip"].half()
-        elif args.precision == "bf16":
-            input_dict["images"] = input_dict["images"].bfloat16()
-            input_dict["images_clip"] = input_dict["images_clip"].bfloat16()
-        else:
-            input_dict["images"] = input_dict["images"].float()
-            input_dict["images_clip"] = input_dict["images_clip"].float()
+            output_dict = model_engine(**input_dict)
 
-        output_dict = model_engine(**input_dict)
+            pred_masks = output_dict["pred_masks"]
+            masks_list = output_dict["gt_masks"][0].int()
+            output_list = (pred_masks[0] > 0).int()
+            assert len(pred_masks) == 1
 
-        pred_masks = output_dict["pred_masks"]
-        masks_list = output_dict["gt_masks"][0].int()
-        output_list = (pred_masks[0] > 0).int()
-        assert len(pred_masks) == 1
+            # 计算交并比
+            intersection, union, acc_iou = 0.0, 0.0, 0.0
+            for mask_i, output_i in zip(masks_list, output_list):
+                intersection_i, union_i, _ = intersectionAndUnionGPU(
+                    output_i.contiguous().clone(), mask_i.contiguous(), 2, ignore_index=255
+                )
+                intersection += intersection_i
+                union += union_i
+                acc_iou += intersection_i / (union_i + 1e-5)
+                acc_iou[union_i == 0] += 1.0  # no-object target
+            intersection, union = intersection.cpu().numpy(), union.cpu().numpy()
+            acc_iou = acc_iou.cpu().numpy() / masks_list.shape[0]
+            intersection_meter.update(intersection), union_meter.update(
+                union
+            ), acc_iou_meter.update(acc_iou, n=masks_list.shape[0])
 
-        intersection, union, acc_iou = 0.0, 0.0, 0.0
-        for mask_i, output_i in zip(masks_list, output_list):
-            intersection_i, union_i, _ = intersectionAndUnionGPU(
-                output_i.contiguous().clone(), mask_i.contiguous(), 2, ignore_index=255
-            )
-            intersection += intersection_i
-            union += union_i
-            acc_iou += intersection_i / (union_i + 1e-5)
-            acc_iou[union_i == 0] += 1.0  # no-object target
-        intersection, union = intersection.cpu().numpy(), union.cpu().numpy()
-        acc_iou = acc_iou.cpu().numpy() / masks_list.shape[0]
-        intersection_meter.update(intersection), union_meter.update(
-            union
-        ), acc_iou_meter.update(acc_iou, n=masks_list.shape[0])
+        intersection_meter.all_reduce()
+        union_meter.all_reduce()
+        acc_iou_meter.all_reduce()
 
-    intersection_meter.all_reduce()
-    union_meter.all_reduce()
-    acc_iou_meter.all_reduce()
+        iou_class = intersection_meter.sum / (union_meter.sum + 1e-10)
+        ciou = iou_class[1]
+        giou = acc_iou_meter.avg[1]
 
-    iou_class = intersection_meter.sum / (union_meter.sum + 1e-10)
-    ciou = iou_class[1]
-    giou = acc_iou_meter.avg[1]
+        if args.local_rank == 0:
+            writer.add_scalar("val/giou", giou, epoch)
+            writer.add_scalar("val/ciou", ciou, epoch)
+            print("giou: {:.4f}, ciou: {:.4f}".format(giou, ciou))
 
+        return giou, ciou
+
+def main(args):
+    args = parse_args(args)
+    args.log_dir = os.path.join(args.log_base_dir, args.exp_name)
     if args.local_rank == 0:
-        writer.add_scalar("val/giou", giou, epoch)
-        writer.add_scalar("val/giou", ciou, epoch)
-        print("giou: {:.4f}, ciou: {:.4f}".format(giou, ciou))
+        os.makedirs(args.log_dir, exist_ok=True)
+        writer = SummaryWriter(args.log_dir)
+    else:
+        writer = None
 
-    return giou, ciou
+    model, tokenizer = create_model(args)
+    load_weight(model, args)
+    world_size = torch.cuda.device_count()
+    train_dataset, val_dataset = create_datasets(args, tokenizer, world_size)
+    args.distributed = world_size > 1
 
+    ds_config = {
+        "train_micro_batch_size_per_gpu": args.batch_size,
+        "gradient_accumulation_steps": args.grad_accumulation_steps,
+        "optimizer": {
+            "type": "AdamW",
+            "params": {
+                "lr": args.lr,
+                "weight_decay": 0.0,
+                "betas": (args.beta1, args.beta2),
+            },
+        },
+        "scheduler": {
+            "type": "WarmupDecayLR",
+            "params": {
+                "total_num_steps": args.epochs * args.steps_per_epoch,
+                "warmup_min_lr": 0,
+                "warmup_max_lr": args.lr,
+                "warmup_num_steps": 100,
+                "warmup_type": "linear",
+            },
+        },
+        "fp16": {
+            "enabled": args.precision == "fp16",
+        },
+        "bf16": {
+            "enabled": args.precision == "bf16",
+        },
+        "offload_optimizer": {
+          "device": "cpu",
+          "pin_memory": True
+        },
+        "offload_param": {
+            "device": "cpu",
+            "pin_memory": True
+        },
+        "gradient_clipping": 1.0,
+        "zero_optimization": {
+            "stage": 3,
+            "contiguous_gradients": True,
+            "overlap_comm": True,
+            "reduce_scatter": True,
+            "reduce_bucket_size": 5e8,
+            "allgather_bucket_size": 5e8,
+        },
+    }
+    model_engine, optimizer, train_loader, scheduler = deepspeed.initialize(
+        model=model,
+        model_parameters=model.parameters(),
+        training_data=train_dataset,
+        collate_fn=partial(collate_fn, tokenizer=tokenizer),
+        config=ds_config,
+    )
 
+    if val_dataset is not None:
+        assert args.val_batch_size == 1
+        val_sampler = torch.utils.data.distributed.DistributedSampler(
+            val_dataset, shuffle=False, drop_last=False
+        )
+        val_loader = torch.utils.data.DataLoader(
+            val_dataset,
+            batch_size=args.val_batch_size,
+            shuffle=False,
+            num_workers=args.workers,
+            pin_memory=False,
+            sampler=val_sampler,
+            collate_fn=partial(collate_fn, tokenizer=tokenizer),
+        )
+
+    train_iter = itertools.cycle(train_loader)
+    best_score, cur_ciou = 0.0, 0.0
+
+    if args.eval_only:
+        giou, ciou = validate_epoch(val_loader, model_engine, writer, args)
+        exit(0)
+
+    for epoch in range(args.start_epoch, args.epochs):
+        train_epoch(train_iter, epoch, model_engine, scheduler, writer, args)
+
+        if args.no_eval == False:
+            giou, ciou = validate_epoch(val_loader, epoch, model_engine, writer, args)
+            is_best = giou > best_score
+            best_score = max(giou, best_score)
+            cur_ciou = ciou if is_best else cur_ciou
+
+        if args.no_eval or is_best:
+            save_dir = os.path.join(args.log_dir, "ckpt_model")
+            if args.local_rank == 0:
+                torch.save(
+                {"epoch": epoch}, os.path.join(args.log_dir, "meta_log_giou{:.3f}_ciou{:.3f}.pth".format(best_score, cur_ciou)),
+                )
+                if os.path.exists(save_dir):
+                    shutil.rmtree(save_dir)
+            torch.distributed.barrier()
+            model_engine.save_checkpoint(save_dir)
+    
 if __name__ == "__main__":
     main(sys.argv[1:])

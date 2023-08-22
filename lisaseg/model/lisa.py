@@ -6,14 +6,14 @@ import torch.nn.functional as F
 from peft import LoraConfig, get_peft_model
 from transformers import BitsAndBytesConfig, CLIPVisionModel
 
-from utils.utils import (
+from lisaseg.utils.utils import (
     DEFAULT_IM_END_TOKEN,
     DEFAULT_IM_START_TOKEN,
     DEFAULT_IMAGE_PATCH_TOKEN,
 )
 
-from .llava.model.llava import LlavaLlamaForCausalLM
-from .segment_anything import build_sam_vit_h
+from lisaseg.model.llava.model.llava import LlavaLlamaForCausalLM
+from lisaseg.model.segment_anything import build_sam_vit_h
 
 
 def dice_loss(
