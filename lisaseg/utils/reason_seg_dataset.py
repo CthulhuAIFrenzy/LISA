@@ -13,7 +13,7 @@ from lisaseg.model.segment_anything.utils.transforms import ResizeLongestSide
 
 from lisaseg.utils.conversation import get_default_conv_template
 from lisaseg.utils.data_processing import get_mask_from_json
-from lisaseg.utils.utils import (
+from lisaseg.utils import (
     ANSWER_LIST,
     DEFAULT_IM_END_TOKEN,
     DEFAULT_IM_START_TOKEN,

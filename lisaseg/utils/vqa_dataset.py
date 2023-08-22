@@ -10,7 +10,7 @@ from transformers import CLIPImageProcessor
 from lisaseg.model.segment_anything.utils.transforms import ResizeLongestSide
 
 from lisaseg.utils.conversation import get_default_conv_template
-from lisaseg.utils.utils import (
+from lisaseg.utils import (
     DEFAULT_IM_END_TOKEN,
     DEFAULT_IM_START_TOKEN,
     DEFAULT_IMAGE_PATCH_TOKEN,

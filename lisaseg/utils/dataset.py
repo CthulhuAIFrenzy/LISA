@@ -17,7 +17,7 @@ from lisaseg.utils.reason_seg_dataset import ReasonSegDataset
 from lisaseg.utils.refer import REFER
 from lisaseg.utils.refer_seg_dataset import ReferSegDataset
 from lisaseg.utils.sem_seg_dataset import SemSegDataset
-from lisaseg.utils.utils import (
+from lisaseg.utils import (
     DEFAULT_IM_END_TOKEN,
     DEFAULT_IM_START_TOKEN,
     DEFAULT_IMAGE_PATCH_TOKEN,

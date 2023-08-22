@@ -6,7 +6,7 @@ import torch.nn.functional as F
 from peft import LoraConfig, get_peft_model
 from transformers import BitsAndBytesConfig, CLIPVisionModel
 
-from lisaseg.utils.utils import (
+from lisaseg.utils import (
     DEFAULT_IM_END_TOKEN,
     DEFAULT_IM_START_TOKEN,
     DEFAULT_IMAGE_PATCH_TOKEN,
@@ -14,53 +14,7 @@ from lisaseg.utils.utils import (
 
 from lisaseg.model.llava.model.llava import LlavaLlamaForCausalLM
 from lisaseg.model.segment_anything import build_sam_vit_h
-
-
-def dice_loss(
-    inputs: torch.Tensor,
-    targets: torch.Tensor,
-    num_masks: float,
-    scale=1000,  # 100000.0,
-    eps=1e-6,
-):
-    """
-    Compute the DICE loss, similar to generalized IOU for masks
-    Args:
-        inputs: A float tensor of arbitrary shape.
-                The predictions for each example.
-        targets: A float tensor with the same shape as inputs. Stores the binary
-                 classification label for each element in inputs
-                (0 for the negative class and 1 for the positive class).
-    """
-    inputs = inputs.sigmoid()
-    inputs = inputs.flatten(1, 2)
-    targets = targets.flatten(1, 2)
-    numerator = 2 * (inputs / scale * targets).sum(-1)
-    denominator = (inputs / scale).sum(-1) + (targets / scale).sum(-1)
-    loss = 1 - (numerator + eps) / (denominator + eps)
-    loss = loss.sum() / (num_masks + 1e-8)
-    return loss
-
-
-def sigmoid_ce_loss(
-    inputs: torch.Tensor,
-    targets: torch.Tensor,
-    num_masks: float,
-):
-    """
-    Args:
-        inputs: A float tensor of arbitrary shape.
-                The predictions for each example.
-        targets: A float tensor with the same shape as inputs. Stores the binary
-                 classification label for each element in inputs
-                (0 for the negative class and 1 for the positive class).
-    Returns:
-        Loss tensor
-    """
-    loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction="none")
-    loss = loss.flatten(1, 2).mean(1).sum() / (num_masks + 1e-8)
-    return loss
-
+from lisaseg.core.losses import dice_loss, sigmoid_ce_loss
 
 class LISA(nn.Module):
     def __init__(
@@ -100,54 +54,55 @@ class LISA(nn.Module):
         num_new_tokens = tokenizer.add_tokens(
             [DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN], special_tokens=True
         )
-        if precision == "bf16":
-            self.lm = LlavaLlamaForCausalLM.from_pretrained(
-                llm_version,
-                torch_dtype=torch.bfloat16,
-                cache_dir=None,
-                low_cpu_mem_usage=True,
-            )
-        elif precision == "fp16":
-            if load_in_4bit:
-                self.lm = LlavaLlamaForCausalLM.from_pretrained(
-                    llm_version,
-                    load_in_4bit=True,
-                    cache_dir=None,
-                    low_cpu_mem_usage=True,
-                    device_map="auto",
-                    quantization_config=BitsAndBytesConfig(
-                        load_in_4bit=True,
-                        bnb_4bit_compute_dtype=torch.float16,
-                        bnb_4bit_use_double_quant=True,
-                        bnb_4bit_quant_type="nf4",
-                    ),
-                )
-            elif load_in_8bit:
-                self.lm = LlavaLlamaForCausalLM.from_pretrained(
-                    llm_version,
-                    load_in_8bit=True,
-                    cache_dir=None,
-                    low_cpu_mem_usage=True,
-                    device_map="auto",
-                )
-            else:
-                self.lm = LlavaLlamaForCausalLM.from_pretrained(
-                    llm_version,
-                    torch_dtype=torch.half,
-                    cache_dir=None,
-                    low_cpu_mem_usage=True,
-                )
-        else:
-            self.lm = LlavaLlamaForCausalLM.from_pretrained(
-                llm_version,
-                torch_dtype=torch.float32,
-                cache_dir=None,
-                low_cpu_mem_usage=True,
-            )
+        
+        precision_configs = {
+            "bf16": {
+                "torch_dtype": torch.bfloat16,
+                "load_in_4bit": False,
+                "load_in_8bit": False,
+                "quantization_config": None,
+            },
+            "fp16": {
+                "torch_dtype": torch.half,
+                "load_in_4bit": load_in_4bit,
+                "load_in_8bit": load_in_8bit,
+                "quantization_config": BitsAndBytesConfig(
+                    load_in_4bit=load_in_4bit,
+                    bnb_4bit_compute_dtype=torch.float16,
+                    bnb_4bit_use_double_quant=True,
+                    bnb_4bit_quant_type="nf4",
+                ) if load_in_4bit else None,
+            },
+            "default": {
+                "torch_dtype": torch.float32,
+                "load_in_4bit": False,
+                "load_in_8bit": False,
+                "quantization_config": None,
+            }
+        }
 
+        precision_config = precision_configs.get(precision, precision_configs["default"])
+
+        self.lm = LlavaLlamaForCausalLM.from_pretrained(
+            llm_version,
+            torch_dtype=precision_config["torch_dtype"],
+            cache_dir=None,
+            low_cpu_mem_usage=True,
+            load_in_4bit=precision_config["load_in_4bit"],
+            load_in_8bit=precision_config["load_in_8bit"],
+            quantization_config=precision_config["quantization_config"],
+            device_map="auto" if precision == "fp16" else None,
+        )
+
+        # Model Initialization
         self.lm.enable_input_require_grads()
         self.lm.gradient_checkpointing_enable()
         self.lm.config.use_cache = False
+        self.lm.model.config.eos_token_id = tokenizer.eos_token_id
+        self.lm.model.config.bos_token_id = tokenizer.bos_token_id
+        self.lm.model.config.pad_token_id = tokenizer.pad_token_id
+
+        # Initialize Vision Tower
         model_vision_dict = self.lm.get_model().initialize_vision_modules(
             vision_tower=vision_tower,
             mm_vision_select_layer=mm_vision_select_layer,
@@ -155,44 +110,33 @@ class LISA(nn.Module):
         )
         vision_config = model_vision_dict["vision_config"]
         vision_tower = self.lm.get_model().vision_tower[0]
-        self.lm.model.config.eos_token_id = tokenizer.eos_token_id
-        self.lm.model.config.bos_token_id = tokenizer.bos_token_id
-        self.lm.model.config.pad_token_id = tokenizer.pad_token_id
 
         if vision_tower.device.type == "meta":
-            if precision == "bf16":
-                vision_tower = CLIPVisionModel.from_pretrained(
-                    vision_tower.config._name_or_path,
-                    torch_dtype=torch.bfloat16,
-                    low_cpu_mem_usage=True,
-                ).cuda(local_rank)
-            elif precision == "fp16":
-                vision_tower = CLIPVisionModel.from_pretrained(
-                    vision_tower.config._name_or_path,
-                    torch_dtype=torch.half,
-                    low_cpu_mem_usage=True,
-                ).cuda(local_rank)
-            else:
-                vision_tower = CLIPVisionModel.from_pretrained(
-                    vision_tower.config._name_or_path,
-                    torch_dtype=torch.float32,
-                    low_cpu_mem_usage=True,
-                ).cuda(local_rank)
+            vision_dtype = {
+                "bf16": torch.bfloat16,
+                "fp16": torch.half,
+            }.get(precision, torch.float32)
+            vision_tower = CLIPVisionModel.from_pretrained(
+                vision_tower.config._name_or_path,
+                torch_dtype=vision_dtype,
+                low_cpu_mem_usage=True,
+            ).cuda(local_rank)
             self.lm.get_model().vision_tower[0] = vision_tower
         else:
-            if precision == "bf16":
-                vision_tower.to(device="cuda", dtype=torch.bfloat16)
-            elif precision == "fp16":
-                vision_tower.to(device="cuda", dtype=torch.half)
-            else:
-                vision_tower.to(device="cuda", dtype=torch.float32)
+            vision_dtype = {
+                "bf16": torch.bfloat16,
+                "fp16": torch.half,
+            }.get(precision, torch.float32)
+            vision_tower.to(device="cuda", dtype=vision_dtype)
 
+        # Configurations
         self.lm.config.tune_mm_mlp_adapter = False
         self.lm.config.freeze_mm_mlp_adapter = False
         self.lm.config.mm_use_im_start_end = True
         vision_config.use_im_start_end = True
         self.lm.config.sep_image_conv_front = False
 
+        # Initialize Vision Tokenizer
         self.lm.initialize_vision_tokenizer(
             mm_use_im_start_end=True,
             tokenizer=tokenizer,
@@ -200,8 +144,10 @@ class LISA(nn.Module):
             device=local_rank,
             tune_mm_mlp_adapter=False,
         )
+
+        # Freeze LM Parameters
         if freeze_lm:
-            for n, param in self.lm.named_parameters():
+            for param in self.lm.parameters():
                 param.requires_grad = False
 
         # LoRA
@@ -217,8 +163,8 @@ class LISA(nn.Module):
             self.lm = get_peft_model(self.lm, config)
             self.lm.print_trainable_parameters()
 
+        # Additional Configurations and Setup
         self.llm_version = llm_version
-
         self.seg_token_idx = seg_token_idx
         self.lm.resize_token_embeddings(len(tokenizer))
 
@@ -228,7 +174,7 @@ class LISA(nn.Module):
             ):
                 p.requires_grad = True
 
-        # SAM
+        # SAM Setup
         self.visual_model = build_sam_vit_h(vision_pretrained)
         for param in self.visual_model.parameters():
             param.requires_grad = False
@@ -237,7 +183,7 @@ class LISA(nn.Module):
             for param in self.visual_model.mask_decoder.parameters():
                 param.requires_grad = True
 
-        # Projection layer
+        # Projection Layer
         in_dim = self.lm.config.hidden_size
         text_fc = [
             nn.Linear(in_dim, in_dim),
@@ -266,27 +212,27 @@ class LISA(nn.Module):
         inference: bool = False,
         **kwargs,
     ):
+        # Compute image embeddings
         image_embeddings = self.get_visual_embs(images)
         batch_size = image_embeddings.shape[0]
         assert batch_size == len(offset) - 1
 
+        # Prepare segmentation token mask
         seg_token_mask = input_ids[:, 1:] == self.seg_token_idx
         seg_token_mask = torch.cat(
-            [
-                seg_token_mask,
-                torch.zeros((seg_token_mask.shape[0], 1)).bool().cuda(self.local_rank),
-            ],
+            [seg_token_mask, torch.zeros((seg_token_mask.shape[0], 1)).bool().cuda(self.local_rank)],
             dim=1,
         )
 
         if inference:
-            n_batch = 1
+            # Inference mode
             length = input_ids.shape[0]
             assert images_clip.shape[0] == 1
             images_clip_extend = images_clip.expand(length, -1, -1, -1).contiguous()
 
+            # Generate output hidden states
             output_hidden_states = []
-            for i in range(n_batch):
+            for i in range(1):  # Change to n_batch if needed
                 start_i, end_i = i * length, min((i + 1) * length, input_ids.shape[0])
                 output_i = self.lm(
                     images=images_clip_extend[: end_i - start_i],
@@ -297,13 +243,11 @@ class LISA(nn.Module):
                 output_hidden_states.append(output_i.hidden_states)
                 torch.cuda.empty_cache()
 
-            output_hidden_states_list = []
-            output_hidden_states_level = torch.cat(output_hidden_states, dim=0)
-            output_hidden_states_list.append(output_hidden_states_level)
-            output_hidden_states = output_hidden_states_list
+            output_hidden_states = torch.cat(output_hidden_states, dim=0)
             output = None
 
         else:
+            # Training mode
             images_clip_list = []
             for i in range(len(offset) - 1):
                 start_i, end_i = offset[i], offset[i + 1]
@@ -316,6 +260,7 @@ class LISA(nn.Module):
                 images_clip_list.append(images_clip_i)
             images_clip = torch.cat(images_clip_list, dim=0)
 
+            # Run LM model
             output = self.lm(
                 images=images_clip,
                 attention_mask=attention_masks,
@@ -325,39 +270,29 @@ class LISA(nn.Module):
             )
             output_hidden_states = output.hidden_states
 
-        hidden_states = []
+        # Compute hidden states
+        hidden_states = self.text_hidden_fcs[0](output_hidden_states[-1])
+        last_hidden_state = hidden_states.sum(dim=-1)
 
-        assert len(self.text_hidden_fcs) == 1
-        hidden_states.append(self.text_hidden_fcs[0](output_hidden_states[-1]))
-
-        last_hidden_state = torch.stack(hidden_states, dim=-1).sum(dim=-1)
-
+        # Prepare prediction embeddings
         pred_embeddings = last_hidden_state[seg_token_mask]
         seg_token_counts = seg_token_mask.int().sum(-1)  # [bs, ]
-
         seg_token_offset = seg_token_counts.cumsum(-1)
-        seg_token_offset = torch.cat(
-            [torch.zeros(1).long().cuda(), seg_token_offset], dim=0
-        )
-
+        seg_token_offset = torch.cat([torch.zeros(1).long().cuda(), seg_token_offset], dim=0)
         seg_token_offset = seg_token_offset[offset]
+        pred_embeddings_ = [pred_embeddings[seg_token_offset[i]:seg_token_offset[i+1]] for i in range(len(seg_token_offset) - 1)]
 
-        pred_embeddings_ = []
-        for i in range(len(seg_token_offset) - 1):
-            start_i, end_i = seg_token_offset[i], seg_token_offset[i + 1]
-            pred_embeddings_.append(pred_embeddings[start_i:end_i])
-        pred_embeddings = pred_embeddings_
-
+        # Generate prediction masks
         multimask_output = False
         pred_masks = []
-        for i in range(len(pred_embeddings)):
+        for i, pred_embedding in enumerate(pred_embeddings_):
             sparse_embeddings, dense_embeddings = self.visual_model.prompt_encoder(
                 points=None,
                 boxes=None,
                 masks=None,
-                text_embeds=pred_embeddings[i].unsqueeze(1),
+                text_embeds=pred_embedding.unsqueeze(1),
             )
-            sparse_embeddings = sparse_embeddings.to(pred_embeddings[i].dtype)
+            sparse_embeddings = sparse_embeddings.to(pred_embedding.dtype)
             low_res_masks, iou_predictions = self.visual_model.mask_decoder(
                 image_embeddings=image_embeddings[i].unsqueeze(0),
                 image_pe=self.visual_model.prompt_encoder.get_dense_pe(),
@@ -371,42 +306,6 @@ class LISA(nn.Module):
                 original_size=label_list[i].shape,
             )
             pred_masks.append(pred_mask[:, 0])
-
-        model_output = output
-        gt_masks = masks_list
-
-        if inference:
-            return {
-                "pred_masks": pred_masks,
-                "gt_masks": gt_masks,
-            }
-
-        output = model_output.logits
-
-        ce_loss = model_output.loss
-        ce_loss = ce_loss * self.ce_loss_weight
-        loss = ce_loss
-        mask_bce_loss = 0
-        mask_dice_loss = 0
-        num_masks = 0
-        for batch_idx in range(len(pred_masks)):
-            gt_mask = gt_masks[batch_idx]
-            pred_mask = pred_masks[batch_idx]
-
-            assert (
-                gt_mask.shape[0] == pred_mask.shape[0]
-            ), "gt_mask.shape: {}, pred_mask.shape: {}".format(
-                gt_mask.shape, pred_mask.shape
-            )
-            mask_bce_loss += (
-                sigmoid_ce_loss(pred_mask, gt_mask, num_masks=gt_mask.shape[0])
-                * gt_mask.shape[0]
-            )
-            mask_dice_loss += (
-                dice_loss(pred_mask, gt_mask, num_masks=gt_mask.shape[0])
-                * gt_mask.shape[0]
-            )
-            num_masks += gt_mask.shape[0]
 
         mask_bce_loss = self.bce_loss_weight * mask_bce_loss / (num_masks + 1e-8)
         mask_dice_loss = self.dice_loss_weight * mask_dice_loss / (num_masks + 1e-8)
@@ -446,40 +345,29 @@ class LISA(nn.Module):
 
             seg_token_mask = output_ids[:, 1:] == self.seg_token_idx
 
-            hidden_states = []
-
-            assert len(self.text_hidden_fcs) == 1
-            hidden_states.append(self.text_hidden_fcs[0](output_hidden_states))
-
-            last_hidden_state = torch.stack(hidden_states, dim=-1).sum(dim=-1)
+            hidden_states = [self.text_hidden_fcs[0](output_hidden_states)]
+            last_hidden_state = hidden_states[0].sum(dim=-1)
             pred_embeddings = last_hidden_state[seg_token_mask]
 
             seg_token_counts = seg_token_mask.int().sum(-1)  # [bs, ]
-            seg_token_offset = seg_token_counts.cumsum(-1)
-            seg_token_offset = torch.cat(
-                [torch.zeros(1).long().cuda(), seg_token_offset], dim=0
-            )
-
-            pred_embeddings_ = []
-            for i in range(len(seg_token_offset) - 1):
-                start_i, end_i = seg_token_offset[i], seg_token_offset[i + 1]
-                pred_embeddings_.append(pred_embeddings[start_i:end_i])
-            pred_embeddings = pred_embeddings_
+            seg_token_offset = torch.cat([torch.zeros(1).long().cuda(), seg_token_counts.cumsum(-1)], dim=0)
+            seg_token_offset = seg_token_offset[seg_token_offset <= len(pred_embeddings)]
+            pred_embeddings_ = [pred_embeddings[seg_token_offset[i]:seg_token_offset[i + 1]] for i in range(len(seg_token_offset) - 1)]
 
             image_embeddings = self.get_visual_embs(images)
-
             multimask_output = False
             pred_masks = []
-            for i in range(len(pred_embeddings)):
+
+            for i, pred_embedding in enumerate(pred_embeddings_):
                 sparse_embeddings, dense_embeddings = self.visual_model.prompt_encoder(
                     points=None,
                     boxes=None,
                     masks=None,
-                    text_embeds=pred_embeddings[i].unsqueeze(1),
+                    text_embeds=pred_embedding.unsqueeze(1),
                 )
 
-                sparse_embeddings = sparse_embeddings.to(pred_embeddings[i].dtype)
-                low_res_masks, iou_predictions = self.visual_model.mask_decoder(
+                sparse_embeddings = sparse_embeddings.to(pred_embedding.dtype)
+                low_res_masks, _ = self.visual_model.mask_decoder(
                     image_embeddings=image_embeddings[i].unsqueeze(0),
                     image_pe=self.visual_model.prompt_encoder.get_dense_pe(),
                     sparse_prompt_embeddings=sparse_embeddings,
@@ -495,3 +383,4 @@ class LISA(nn.Module):
                 pred_masks.append(pred_mask[:, 0])
 
         return output_ids, pred_masks
+    # a297ba19c83e91e437fdaa7da52a11d22a0901c2
