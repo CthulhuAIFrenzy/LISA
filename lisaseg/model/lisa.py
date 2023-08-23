@@ -6,16 +6,10 @@ import torch.nn.functional as F
 from peft import LoraConfig, get_peft_model
 from transformers import BitsAndBytesConfig, CLIPVisionModel
 
-from lisaseg.utils import (
-    DEFAULT_IM_END_TOKEN,
-    DEFAULT_IM_START_TOKEN,
-    DEFAULT_IMAGE_PATCH_TOKEN,
-)
-
 from lisaseg.model.llava.model.llava import LlavaLlamaForCausalLM
 from lisaseg.model.segment_anything import build_sam_vit_h
 from lisaseg.core.losses import dice_loss, sigmoid_ce_loss
-
+from lisaseg.utils import DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IMAGE_PATCH_TOKEN
 
 class LISA(nn.Module):
     def __init__(
@@ -49,117 +43,136 @@ class LISA(nn.Module):
         self.ce_loss_weight = ce_loss_weight
         self.dice_loss_weight = dice_loss_weight
         self.bce_loss_weight = bce_loss_weight
+        self.llm_version = llm_version
+        self.seg_token_idx = seg_token_idx
 
-        # LLaVA
+        num_new_tokens = self.add_token_in_tokenizer(self.tokenizer)
+        # Initialize LM Model
+        self.lm = self.initialize_language_model(precision, llm_version, load_in_4bit, load_in_8bit)
+        self.lm.enable_input_require_grads()
+        self.lm.gradient_checkpointing_enable()
+        self.set_lm_config(self.lm, tokenizer)
+        self.set_lm_vision_tower(precision, self.lm, vision_tower, mm_vision_select_layer, local_rank)
+        self.set_lm_vision_tokenizer(self.lm, tokenizer, num_new_tokens, local_rank)
+        
+        if freeze_lm:
+            self.set_requires_grad(self.lm, False)
+        # Set Peft LM
+        self.lm = self.get_peft_lm(self.lm, lora_r, lora_alpha, lora_target_modules, lora_dropout)
+        self.lm.resize_token_embeddings(len(tokenizer))
+        self.set_condition_requires_grad(self.lm, True, ["lm_head", "embed_tokens"], tokenizer)
+
+        # Set Visual SAM Model
+        self.visual_model = self.initialize_vision_model(vision_pretrained)
+        self.set_requires_grad(self.visual_model, False)
+        if train_mask_decoder:
+            self.visual_model.mask_decoder.train()
+            self.set_requires_grad(self.visual_model.mask_decoder, True)
+        # Set Projection Layer
+        self.text_hidden_fcs = self.initialize_vision_projection(self.lm.config.hidden_size, out_dim)
+
+    def add_token_in_tokenizer(self, tokenizer):
         tokenizer.add_tokens([DEFAULT_IMAGE_PATCH_TOKEN], special_tokens=True)
         num_new_tokens = tokenizer.add_tokens(
             [DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN], special_tokens=True
         )
-        if precision == "bf16":
-            self.lm = LlavaLlamaForCausalLM.from_pretrained(
-                llm_version,
-                torch_dtype=torch.bfloat16,
-                cache_dir=None,
-                low_cpu_mem_usage=True,
-            )
-        elif precision == "fp16":
-            if load_in_4bit:
-                self.lm = LlavaLlamaForCausalLM.from_pretrained(
-                    llm_version,
-                    load_in_4bit=True,
-                    cache_dir=None,
-                    low_cpu_mem_usage=True,
-                    device_map="auto",
-                    quantization_config=BitsAndBytesConfig(
-                        load_in_4bit=True,
-                        bnb_4bit_compute_dtype=torch.float16,
-                        bnb_4bit_use_double_quant=True,
-                        bnb_4bit_quant_type="nf4",
-                    ),
-                )
-            elif load_in_8bit:
-                self.lm = LlavaLlamaForCausalLM.from_pretrained(
-                    llm_version,
-                    load_in_8bit=True,
-                    cache_dir=None,
-                    low_cpu_mem_usage=True,
-                    device_map="auto",
-                )
-            else:
-                self.lm = LlavaLlamaForCausalLM.from_pretrained(
-                    llm_version,
-                    torch_dtype=torch.half,
-                    cache_dir=None,
-                    low_cpu_mem_usage=True,
-                )
-        else:
-            self.lm = LlavaLlamaForCausalLM.from_pretrained(
-                llm_version,
-                torch_dtype=torch.float32,
-                cache_dir=None,
-                low_cpu_mem_usage=True,
-            )
+        return num_new_tokens
 
-        self.lm.enable_input_require_grads()
-        self.lm.gradient_checkpointing_enable()
-        self.lm.config.use_cache = False
-        model_vision_dict = self.lm.get_model().initialize_vision_modules(
+    def initialize_language_model(self, precision, llm_version, load_in_4bit, load_in_8bit):
+        precision_configs = {
+            "bf16": {
+                "torch_dtype": torch.bfloat16,
+                "load_in_4bit": False,
+                "load_in_8bit": False,
+                "quantization_config": None,
+            },
+            "fp16": {
+                "torch_dtype": torch.half,
+                "load_in_4bit": load_in_4bit,
+                "load_in_8bit": load_in_8bit,
+                "quantization_config": BitsAndBytesConfig(
+                    load_in_4bit=load_in_4bit,
+                    bnb_4bit_compute_dtype=torch.float16,
+                    bnb_4bit_use_double_quant=True,
+                    bnb_4bit_quant_type="nf4",
+                ) if load_in_4bit else None,
+            },
+            "default": {
+                "torch_dtype": torch.float32,
+                "load_in_4bit": False,
+                "load_in_8bit": False,
+                "quantization_config": None,
+            }
+        }
+
+        precision_config = precision_configs.get(precision, precision_configs["default"])
+        lm = LlavaLlamaForCausalLM.from_pretrained(
+            llm_version,
+            torch_dtype=precision_config["torch_dtype"],
+            cache_dir=None,
+            low_cpu_mem_usage=True,
+            load_in_4bit=precision_config["load_in_4bit"],
+            load_in_8bit=precision_config["load_in_8bit"],
+            quantization_config=precision_config["quantization_config"],
+            device_map="auto" if precision == "fp16" else None,
+        )
+        return lm
+
+    def set_lm_config(self, lm, tokenizer):
+        lm.config.use_cache = False
+        lm.model.config.eos_token_id = tokenizer.eos_token_id
+        lm.model.config.bos_token_id = tokenizer.bos_token_id
+        lm.model.config.pad_token_id = tokenizer.pad_token_id
+
+        lm.config.tune_mm_mlp_adapter = False
+        lm.config.freeze_mm_mlp_adapter = False
+        lm.config.mm_use_im_start_end = True
+        lm.config.sep_image_conv_front = False
+        
+    def set_lm_vision_tower(self, precision, lm, vision_tower, mm_vision_select_layer, local_rank):
+        model_vision_dict = lm.get_model().initialize_vision_modules(
             vision_tower=vision_tower,
             mm_vision_select_layer=mm_vision_select_layer,
             precision=precision,
         )
         vision_config = model_vision_dict["vision_config"]
-        vision_tower = self.lm.get_model().vision_tower[0]
-        self.lm.model.config.eos_token_id = tokenizer.eos_token_id
-        self.lm.model.config.bos_token_id = tokenizer.bos_token_id
-        self.lm.model.config.pad_token_id = tokenizer.pad_token_id
-
+        vision_tower = lm.get_model().vision_tower[0]
+        
+        precision_dtype_map = {
+            "bf16": torch.bfloat16,
+            "fp16": torch.half,
+            "fp32": torch.float32
+        }
         if vision_tower.device.type == "meta":
-            if precision == "bf16":
-                vision_tower = CLIPVisionModel.from_pretrained(
-                    vision_tower.config._name_or_path,
-                    torch_dtype=torch.bfloat16,
-                    low_cpu_mem_usage=True,
-                ).cuda(local_rank)
-            elif precision == "fp16":
-                vision_tower = CLIPVisionModel.from_pretrained(
-                    vision_tower.config._name_or_path,
-                    torch_dtype=torch.half,
-                    low_cpu_mem_usage=True,
-                ).cuda(local_rank)
-            else:
-                vision_tower = CLIPVisionModel.from_pretrained(
-                    vision_tower.config._name_or_path,
-                    torch_dtype=torch.float32,
-                    low_cpu_mem_usage=True,
-                ).cuda(local_rank)
-            self.lm.get_model().vision_tower[0] = vision_tower
+            vision_tower = CLIPVisionModel.from_pretrained(
+                vision_tower.config._name_or_path,
+                torch_dtype=precision_dtype_map.get(precision, torch.float32),
+                low_cpu_mem_usage=True
+            ).cuda(local_rank)
+            lm.get_model().vision_tower[0] = vision_tower
         else:
-            if precision == "bf16":
-                vision_tower.to(device="cuda", dtype=torch.bfloat16)
-            elif precision == "fp16":
-                vision_tower.to(device="cuda", dtype=torch.half)
-            else:
-                vision_tower.to(device="cuda", dtype=torch.float32)
-
-        self.lm.config.tune_mm_mlp_adapter = False
-        self.lm.config.freeze_mm_mlp_adapter = False
-        self.lm.config.mm_use_im_start_end = True
+            vision_tower.to(device="cuda", dtype=precision_dtype_map.get(precision, torch.float32))
         vision_config.use_im_start_end = True
-        self.lm.config.sep_image_conv_front = False
-
-        self.lm.initialize_vision_tokenizer(
+        
+    def set_lm_vision_tokenizer(self, lm, tokenizer, num_new_tokens, local_rank):
+        lm.initialize_vision_tokenizer(
             mm_use_im_start_end=True,
             tokenizer=tokenizer,
             num_new_tokens=num_new_tokens,
             device=local_rank,
             tune_mm_mlp_adapter=False,
         )
-        if freeze_lm:
-            for n, param in self.lm.named_parameters():
-                param.requires_grad = False
-
-        # LoRA
+    
+    def set_requires_grad(self, model, requires_grad):
+        for n, param in model.named_parameters():
+            param.requires_grad = requires_grad
+            
+    def set_condition_requires_grad(self, model, requires_grad, keys, tokenizer):
+        for n, p in model.named_parameters():
+            if any([x in n for x in keys]) and p.shape[0] == len(tokenizer):
+                p.requires_grad = requires_grad
+    
+    def get_peft_lm(self, lm, lora_r, lora_alpha, lora_target_modules, lora_dropout):
         if lora_r > 0:
             config = LoraConfig(
                 r=lora_r,
@@ -169,44 +182,30 @@ class LISA(nn.Module):
                 bias="none",
                 task_type="CAUSAL_LM",
             )
-            self.lm = get_peft_model(self.lm, config)
-            self.lm.print_trainable_parameters()
+            lm = get_peft_model(lm, config)
+            print("lora of peft for lm model.")
+            lm.print_trainable_parameters()
+            return lm
+        return lm
 
-        self.llm_version = llm_version
+    def initialize_vision_model(self, vision_pretrained):
+        return build_sam_vit_h(vision_pretrained)
 
-        self.seg_token_idx = seg_token_idx
-        self.lm.resize_token_embeddings(len(tokenizer))
-
-        for n, p in self.lm.named_parameters():
-            if any([x in n for x in ["lm_head", "embed_tokens"]]) and p.shape[0] == len(
-                tokenizer
-            ):
-                p.requires_grad = True
-
-        # SAM
-        self.visual_model = build_sam_vit_h(vision_pretrained)
-        for param in self.visual_model.parameters():
-            param.requires_grad = False
-        if train_mask_decoder:
-            self.visual_model.mask_decoder.train()
-            for param in self.visual_model.mask_decoder.parameters():
-                param.requires_grad = True
-
+    def initialize_vision_projection(self, in_dim, out_dim):
         # Projection layer
-        in_dim = self.lm.config.hidden_size
         text_fc = [
             nn.Linear(in_dim, in_dim),
             nn.ReLU(inplace=True),
             nn.Linear(in_dim, out_dim),
             nn.Dropout(0.0),
         ]
-        self.text_hidden_fcs = nn.ModuleList([nn.Sequential(*text_fc)])
+        return nn.ModuleList([nn.Sequential(*text_fc)])
 
-    def get_visual_embs(self, pixel_values: torch.FloatTensor):
+    def get_vision_embs(self, pixel_values: torch.FloatTensor):
         with torch.no_grad():
             image_embeddings = self.visual_model.image_encoder(pixel_values)
         return image_embeddings
-
+            
     def forward(
         self,
         images: torch.FloatTensor,
@@ -221,7 +220,7 @@ class LISA(nn.Module):
         inference: bool = False,
         **kwargs,
     ):
-        image_embeddings = self.get_visual_embs(images)
+        image_embeddings = self.get_vision_embs(images)
         batch_size = image_embeddings.shape[0]
         assert batch_size == len(offset) - 1
 
@@ -450,3 +449,5 @@ class LISA(nn.Module):
                 pred_masks.append(pred_mask[:, 0])
 
         return output_ids, pred_masks
+    
+    

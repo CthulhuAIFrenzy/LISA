@@ -175,15 +175,16 @@ def train_epoch(train_iter, epoch, model_engine, scheduler, writer, args):
             input_dict = dict_to_cuda(input_dict)
 
             # 调整精度
-            if args.precision == "fp16":
-                input_dict["images"] = input_dict["images"].half()
-                input_dict["images_clip"] = input_dict["images_clip"].half()
-            elif args.precision == "bf16":
-                input_dict["images"] = input_dict["images"].bfloat16()
-                input_dict["images_clip"] = input_dict["images_clip"].bfloat16()
-            else:
-                input_dict["images"] = input_dict["images"].float()
-                input_dict["images_clip"] = input_dict["images_clip"].float()
+            precision_map = {
+                "fp16": torch.half,
+                "bf16": torch.bfloat16,
+                "default": torch.float32
+            }
+            precision = args.precision if args.precision in precision_map else "default"
+            precision_type = precision_map[precision]
+            input_data_names = ["images", "images_clip"]
+            for name in input_data_names:
+                input_dict[name] = input_dict[name].to(dtype=precision_type)
 
             output_dict = model_engine(**input_dict)
 
